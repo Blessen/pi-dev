@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${PORT:-3001}"
+PORT="${PORT:-7001}"
 HOST="http://localhost:${PORT}/api/chat"
 
 echo "=== 1. Testing simple Hi/Hello message ==="

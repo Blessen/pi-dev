@@ -1,92 +1,99 @@
 import http from "node:http";
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
-import { createModels, createProvider, type Model, Type } from "@earendil-works/pi-ai";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { type AssistantMessage, createModels, createProvider, type Model, type UserMessage } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 
-const PORT = Number(process.env.PORT) || 3001;
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434/v1";
-const MODEL_ID = process.env.MODEL_ID || "qwen3.6:latest";
+import {
+	buildSalesSystemPrompt,
+	type ClientHistoryItem,
+	createInitialState,
+	extractSizingParameters,
+	type GensetCandidate,
+	queryAvailableGensets,
+	type SalesProposalSessionState,
+	updateSessionState,
+} from "./sales_proposal_service.ts";
 
-// 1. Define sample domain tools (e.g. Genset sizing)
-const suggestGensetTool: AgentTool = {
-	name: "suggest_genset",
-	label: "Suggest Genset",
-	description: "Recommends diesel generator options based on required kVA capacity and application.",
-	parameters: Type.Object({
-		kva: Type.Number({ description: "Power rating in kVA required by the customer" }),
-		application: Type.Optional(Type.String({ description: "Industry or application (e.g., hospital, factory, residential)" })),
-	}),
-	execute: async (_toolCallId, params) => {
-		const kva = (params as { kva: number; application?: string }).kva;
-		const application = (params as { kva: number; application?: string }).application || "commercial";
+const PORT = Number(process.env.PORT) || 7001;
+const VLLM_BASE_URL = process.env.VLLM_BASE_URL || "http://192.168.63.12:8000/v1";
+const MODEL_ID = process.env.MODEL_ID || "Qwen/Qwen3-Coder-30B-A3B-Instruct";
 
-		return {
-			content: [
-				{
-					type: "text",
-					text: JSON.stringify({
-						status: "matched",
-						options: [
-							{
-								model: `DG-${kva}-PRIME`,
-								rating_kva: kva,
-								voltage: "415V 3-Phase",
-								estimated_fuel_burn_lph: Math.round(kva * 0.22 * 10) / 10,
-								notes: application.toLowerCase().includes("hospital")
-									? "Includes N+1 auto-mains failure panel recommendation"
-									: "Standard sound-attenuated enclosure",
-							},
-						],
-					}),
-				},
-			],
-			details: { kva, application },
-		};
-	},
-};
+function convertHistoryToMessages(history: ClientHistoryItem[]): AgentMessage[] {
+	const messages: AgentMessage[] = [];
+	const now = Date.now();
+	for (let i = 0; i < history.length; i++) {
+		const item = history[i];
+		if (!item.content || typeof item.content !== "string" || item.content.trim() === "") {
+			continue;
+		}
+		const timestamp = now - (history.length - i) * 1000;
+		if (item.role === "assistant") {
+			messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: item.content }],
+				api: "openai-completions",
+				provider: "vllm",
+				model: MODEL_ID,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop",
+				timestamp,
+			} as AssistantMessage);
+		} else if (item.role === "user") {
+			messages.push({
+				role: "user",
+				content: item.content,
+				timestamp,
+			} as UserMessage);
+		}
+	}
+	return messages;
+}
 
-// 2. Register local Ollama model provider
-const ollamaModel: Model<"openai-completions"> = {
+// 1. Register remote vLLM model provider
+const vllmModel: Model<"openai-completions"> = {
 	id: MODEL_ID,
-	name: "Ollama Qwen 3.6",
+	name: "Qwen 30B (vLLM)",
 	api: "openai-completions",
-	provider: "ollama",
-	baseUrl: OLLAMA_BASE_URL,
+	provider: "vllm",
+	baseUrl: VLLM_BASE_URL,
 	reasoning: false,
 	input: ["text"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 32768,
+	contextWindow: 100000,
 	maxTokens: 4096,
 };
 
-const ollamaProvider = createProvider({
-	id: "ollama",
-	name: "Local Ollama",
-	baseUrl: OLLAMA_BASE_URL,
-	auth: { apiKey: { name: "Ollama", resolve: async () => ({ auth: { apiKey: "ollama" } }) } },
-	models: [ollamaModel],
+const vllmProvider = createProvider({
+	id: "vllm",
+	name: "Remote vLLM",
+	baseUrl: VLLM_BASE_URL,
+	auth: { apiKey: { name: "vLLM", resolve: async () => ({ auth: { apiKey: "none" } }) } },
+	models: [vllmModel],
 	api: openAICompletionsApi(),
 });
 
 const models = createModels();
-models.setProvider(ollamaProvider);
+models.setProvider(vllmProvider);
 
-// 3. System Prompt containing business guidelines
-const SYSTEM_PROMPT = `You are the lead sales and service orchestrator for a power solutions company.
-Guidelines:
-1. Always recommend suitable genset models using the 'suggest_genset' tool when user mentions capacity or loads.
-2. If application is hospital or medical, emphasize power redundancy.
-3. Be professional, technical, and concise.`;
+// Active in-memory session state for sales proposal
+let sessionState: SalesProposalSessionState = createInitialState();
+let cachedCandidates: GensetCandidate[] | null = null;
 
-// 4. HTTP SSE Server
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+	// CORS Headers
 	res.setHeader("Access-Control-Allow-Origin", "*");
-	res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+	res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 	res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
 	if (req.method === "OPTIONS") {
-		res.writeHead(204);
+		res.writeHead(200);
 		res.end();
+		return;
+	}
+
+	if (req.method === "GET" && req.url === "/api/health") {
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.end(JSON.stringify({ status: "ok", model: MODEL_ID, vllm: VLLM_BASE_URL, session: sessionState }));
 		return;
 	}
 
@@ -98,12 +105,43 @@ const server = http.createServer((req, res) => {
 
 		req.on("end", async () => {
 			try {
-				const { message } = JSON.parse(body || "{}");
-				if (!message) {
-					res.writeHead(400, { "Content-Type": "application/json" });
-					res.end(JSON.stringify({ error: "Missing 'message' in request body" }));
+				const parsed = JSON.parse(body || "{}");
+				const message = (parsed.message || "").trim();
+				const history: ClientHistoryItem[] = Array.isArray(parsed.history) ? parsed.history : [];
+				const action = parsed.action;
+
+				if (action === "reset" || (Array.isArray(history) && history.length === 0 && !message)) {
+					sessionState = createInitialState();
+					cachedCandidates = null;
+					console.log("[Sales Session] State reset to initial state.");
+					res.writeHead(200, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ status: "reset", session: sessionState }));
 					return;
 				}
+
+				if (!message) {
+					res.writeHead(400, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: "Missing message" }));
+					return;
+				}
+
+				if (Array.isArray(history) && history.length === 0) {
+					sessionState = createInitialState();
+					cachedCandidates = null;
+				}
+
+				const startTime = Date.now();
+				console.log(`\n================================================================`);
+				console.log(`[Sales Agent Turn ${sessionState.historyTurns + 1}] Incoming message: "${message}"`);
+				console.log(`[Session State Before] ratingKva: ${sessionState.ratingKva}, blockLoadingKva: ${sessionState.blockLoadingKva}, footprint: ${sessionState.footprint}, step: ${sessionState.step}`);
+
+				// Step 1 Extraction: Extract sizing parameters using LLM without regex
+				const extracted = await extractSizingParameters(message, sessionState, VLLM_BASE_URL, MODEL_ID);
+				console.log(`[Parameter Extraction Result]`, JSON.stringify(extracted));
+
+				// Update session state
+				sessionState = updateSessionState(sessionState, extracted);
+				console.log(`[Session State After] ratingKva: ${sessionState.ratingKva}, blockLoadingKva: ${sessionState.blockLoadingKva}, footprint: ${sessionState.footprint}, step: ${sessionState.step}`);
 
 				res.writeHead(200, {
 					"Content-Type": "text/event-stream",
@@ -111,53 +149,85 @@ const server = http.createServer((req, res) => {
 					Connection: "keep-alive",
 				});
 
+				const sendEvent = (eventData: Record<string, unknown>) => {
+					res.write(`data: ${JSON.stringify(eventData)}\n\n`);
+				};
+
+				// Step 2 Transition: If all 3 values are gathered, trigger available gensets query
+				if (sessionState.step === 2 && !cachedCandidates && sessionState.ratingKva && sessionState.blockLoadingKva) {
+					console.log("[Sales Agent] Step 1 Complete -> Transitioning to Step 2 (Query Available Gensets)");
+					sendEvent({
+						kind: "tool_start",
+						tool: "query_available_gensets",
+						args: {
+							rating_kva: sessionState.ratingKva,
+							block_loading_kva: sessionState.blockLoadingKva,
+							footprint: sessionState.footprint,
+						},
+					});
+
+					cachedCandidates = await queryAvailableGensets(
+						sessionState.ratingKva,
+						sessionState.blockLoadingKva,
+						sessionState.footprint,
+					);
+
+					sendEvent({
+						kind: "tool_end",
+						tool: "query_available_gensets",
+						result: cachedCandidates,
+					});
+				}
+
+				// Build the guided system prompt for this turn
+				const turnSystemPrompt = buildSalesSystemPrompt(sessionState, cachedCandidates || undefined);
+				const historyMessages = convertHistoryToMessages(history);
+
 				const agent = new Agent({
 					initialState: {
-						systemPrompt: SYSTEM_PROMPT,
-						model: models.getModel("ollama", MODEL_ID)!,
-						tools: [suggestGensetTool],
+						systemPrompt: turnSystemPrompt,
+						model: models.getModel("vllm", MODEL_ID)!,
+						messages: historyMessages,
 					},
 					streamFn: models.streamSimple.bind(models),
 				});
 
-				const unsubscribe = agent.subscribe((event) => {
-					if (event.type === "message_update") {
-						const ev = event.assistantMessageEvent;
-						if (ev.type === "text_delta") {
-							res.write(`data: ${JSON.stringify({ kind: "text", delta: ev.delta })}\n\n`);
-						} else if (ev.type === "thinking_delta") {
-							res.write(`data: ${JSON.stringify({ kind: "thinking", delta: ev.delta })}\n\n`);
-						}
-					} else if (event.type === "tool_execution_start") {
-						res.write(
-							`data: ${JSON.stringify({ kind: "tool_start", tool: event.toolName, args: event.args })}\n\n`,
-						);
-					} else if (event.type === "tool_execution_end") {
-						res.write(
-							`data: ${JSON.stringify({ kind: "tool_end", tool: event.toolCallId, result: event.result })}\n\n`,
-						);
-					} else if (event.type === "agent_end") {
-						res.write(`data: ${JSON.stringify({ kind: "done" })}\n\n`);
-						res.end();
+				agent.subscribe((event) => {
+					if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+						sendEvent({ kind: "text", delta: event.assistantMessageEvent.delta });
 					}
 				});
 
 				await agent.prompt(message);
-				unsubscribe();
+
+				sendEvent({ kind: "done" });
+				res.end();
+
+				const elapsed = Date.now() - startTime;
+				console.log(`[Turn Finished] Completed in ${elapsed}ms. Step: ${sessionState.step}`);
 			} catch (err: unknown) {
 				const errorMessage = err instanceof Error ? err.message : String(err);
-				res.write(`data: ${JSON.stringify({ kind: "error", error: errorMessage })}\n\n`);
-				res.end();
+				console.error("[Sales Agent Error]:", errorMessage);
+				if (!res.headersSent) {
+					res.writeHead(500, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: errorMessage }));
+				} else {
+					res.write(`data: ${JSON.stringify({ kind: "error", error: errorMessage })}\n\n`);
+					res.end();
+				}
 			}
 		});
 		return;
 	}
 
 	res.writeHead(404, { "Content-Type": "application/json" });
-	res.end(JSON.stringify({ error: "Route not found. Use POST /api/chat" }));
+	res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, () => {
-	console.log(`Pi Orchestrator Server running at http://localhost:${PORT}/api/chat`);
-	console.log(`Connected to Ollama: ${OLLAMA_BASE_URL} (Model: ${MODEL_ID})`);
+server.listen(PORT, "0.0.0.0", () => {
+	console.log(`\n================================================================`);
+	console.log(`KOEL Sales Proposal Agent Server running on http://localhost:${PORT}`);
+	console.log(`Target vLLM: ${VLLM_BASE_URL} (Model: ${MODEL_ID})`);
+	console.log(`Status: Step 1 (Requirements Gathering) & Step 2 (Suggest Gensets) Active`);
+	console.log(`================================================================\n`);
 });

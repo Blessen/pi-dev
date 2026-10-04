@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback } from "react";
 import type { ChatMessage, ServerEvent } from "../types/chat";
 
-export function usePiChat(initialEndpoint = "http://localhost:3001/api/chat") {
+export function usePiChat(initialEndpoint = "http://localhost:7001/api/chat") {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [apiEndpoint, setApiEndpoint] = useState(initialEndpoint);
@@ -19,11 +19,22 @@ export function usePiChat(initialEndpoint = "http://localhost:3001/api/chat") {
     setIsStreaming(false);
   }, []);
 
-  const clearChat = useCallback(() => {
+  const clearChat = useCallback(async () => {
     stopStreaming();
     setMessages([]);
     setError(null);
-  }, [stopStreaming]);
+    try {
+      await fetch(apiEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ action: "reset" }),
+      });
+    } catch {
+      // Ignore network errors during reset
+    }
+  }, [stopStreaming, apiEndpoint]);
 
   const sendMessage = useCallback(
     async (userInput: string) => {
@@ -50,6 +61,13 @@ export function usePiChat(initialEndpoint = "http://localhost:3001/api/chat") {
         timestamp: Date.now(),
       };
 
+      const historyPayload = messages
+        .filter((m) => m.content && m.content.trim().length > 0)
+        .map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+
       setMessages((prev) => [...prev, userMessage, initialAssistantMessage]);
       setIsStreaming(true);
 
@@ -62,7 +80,7 @@ export function usePiChat(initialEndpoint = "http://localhost:3001/api/chat") {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ message: trimmed }),
+          body: JSON.stringify({ message: trimmed, history: historyPayload }),
           signal: abortController.signal,
         });
 
@@ -171,7 +189,7 @@ export function usePiChat(initialEndpoint = "http://localhost:3001/api/chat") {
         abortControllerRef.current = null;
       }
     },
-    [apiEndpoint, isStreaming]
+    [apiEndpoint, isStreaming, messages]
   );
 
   return {

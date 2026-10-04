@@ -38,7 +38,7 @@ export function ChatHeader({
           <div className="brand-subtitle">
             <span className="badge-status">
               <span className="status-dot" />
-              Connected (Local Ollama)
+              Connected (Qwen 30B vLLM)
             </span>
           </div>
         </div>
@@ -103,7 +103,7 @@ export function ChatHeader({
                   className="form-input"
                   value={tempEndpoint}
                   onChange={(e) => setTempEndpoint(e.target.value)}
-                  placeholder="http://localhost:3001/api/chat"
+                  placeholder="http://localhost:7001/api/chat"
                   required
                 />
               </div>
